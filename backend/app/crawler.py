@@ -3,6 +3,7 @@ import logging
 import sys
 from datetime import datetime
 from pydantic import BaseModel
+from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from crawl4ai.content_filter_strategy import PruningContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
@@ -75,18 +76,14 @@ def get_crawler_config(session_id: str = None) -> CrawlerRunConfig:
     )
     
     return CrawlerRunConfig(
-        word_count_threshold=5,
         markdown_generator=markdown_generator,
         cache_mode=CacheMode.ENABLED,
         verbose=True,
-        wait_until='domcontentloaded',
-        wait_for_images=True,
-        scan_full_page=True,
-        scroll_delay=0.5,
-        page_timeout=120000,
+        wait_until='networkidle',  # Wait for network to be idle
+        wait_for_timeout=5000,  # Wait 5 seconds after page load
+        page_timeout=60000,  # 1 minute timeout for page load
         screenshot=False,
-        pdf=False,
-        magic=True
+        pdf=False
     )
 
 def normalize_url(url: str) -> str:
@@ -132,12 +129,12 @@ async def discover_pages(
                 result = await crawler.arun(url=url, config=crawler_config)
                 
                 title = "Untitled Page"
-                if result.markdown_v2 and result.markdown_v2.fit_markdown:
-                    content_lines = result.markdown_v2.fit_markdown.split('\n')
-                    if content_lines:
-                        potential_title = content_lines[0].strip('# ').strip()
-                        if potential_title:
-                            title = potential_title
+                if result.page_content:
+                    # Try to find the first heading for title
+                    soup = BeautifulSoup(result.page_content, 'html5lib')
+                    first_heading = soup.find(['h1', 'h2', 'h3'])
+                    if first_heading:
+                        title = first_heading.get_text().strip()
 
                 internal_links = []
                 if hasattr(result, 'links') and isinstance(result.links, dict):
@@ -233,50 +230,176 @@ class PageContent(BaseModel):
     sections: List[dict]  # Hierarchical content structure
 
 async def process_content(content: str) -> dict:
-    """Process markdown content into structured sections with code blocks"""
+    """Process HTML content into structured sections optimized for AI consumption"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(content, 'html5lib')  # Using html5lib for consistent and lenient HTML parsing
+    
+    def extract_code(element):
+        """Extract code block with language"""
+        pre = element.find('pre')
+        if not pre:
+            return None
+        code = pre.find('code')
+        if not code:
+            code = pre  # Some pre tags don't have nested code tags
+        lang = code.get('class', [''])[0].replace('language-', '') if code.get('class') else ''
+        return {
+            "lang": lang,
+            "code": code.get_text().strip()
+        }
+    
+    def extract_table(element):
+        """Extract table data with headers"""
+        headers = []
+        rows = []
+        
+        # Extract headers
+        thead = element.find('thead')
+        if thead:
+            header_row = thead.find('tr')
+            if header_row:
+                headers = [th.get_text().strip() for th in header_row.find_all(['th', 'td'])]
+        
+        # Extract rows
+        tbody = element.find('tbody') or element
+        for tr in tbody.find_all('tr'):
+            row = [td.get_text().strip() for td in tr.find_all('td')]
+            if row:  # Skip empty rows
+                rows.append(row)
+        
+        return {
+            "type": "table",
+            "headers": headers,
+            "rows": rows
+        }
+    
+    def extract_list(element):
+        """Extract list items maintaining nested structure"""
+        items = []
+        for li in element.find_all('li', recursive=False):
+            item = {
+                "text": li.get_text().strip(),
+                "sub_items": []
+            }
+            # Handle nested lists
+            nested_list = li.find(['ul', 'ol'])
+            if nested_list:
+                item["sub_items"] = extract_list(nested_list)["items"]
+            items.append(item)
+        
+        return {
+            "type": "list",
+            "list_type": "ordered" if element.name == "ol" else "unordered",
+            "items": items
+        }
+    
+    def process_element(element, level=1):
+        """Recursively process elements maintaining hierarchy"""
+        if not element or not hasattr(element, 'name'):
+            return None
+            
+        # Handle headings
+        if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            return {
+                "t": element.get_text().strip(),  # title
+                "l": int(element.name[1]),  # level
+                "c": []  # children
+            }
+        
+        # Handle notes, warnings, tips
+        if element.name == 'div' and any(c in element.get('class', []) for c in ['note', 'warning', 'tip', 'info']):
+            note_type = next((c for c in element.get('class', []) if c in ['note', 'warning', 'tip', 'info']), 'note')
+            return {
+                "type": note_type,
+                "text": element.get_text().strip()
+            }
+        
+        # Handle code blocks
+        if element.name == 'pre':
+            code_info = extract_code(element)
+            if code_info:
+                return {
+                    "type": "code",
+                    "lang": code_info["lang"],
+                    "code": code_info["code"]
+                }
+        
+        # Handle tables
+        if element.name == 'table':
+            return extract_table(element)
+        
+        # Handle lists
+        if element.name in ['ul', 'ol']:
+            return extract_list(element)
+        
+        # Handle paragraphs and other text content
+        if element.name == 'p':
+            # Check for inline code
+            inline_code = element.find('code')
+            if inline_code:
+                return {
+                    "type": "inline_code",
+                    "text": element.get_text().strip(),
+                    "code": inline_code.get_text().strip()
+                }
+            return {
+                "type": "text",
+                "text": element.get_text().strip()
+            }
+        
+        # Handle links
+        if element.name == 'a' and element.get('href'):
+            return {
+                "type": "link",
+                "text": element.get_text().strip(),
+                "url": element['href']
+            }
+        
+        return None
+    
     sections = []
-    current_section = {"title": None, "content": [], "subsections": [], "code_blocks": []}
-    in_code_block = False
-    current_code_block = {"language": "", "content": []}
+    current_section = None
     
-    for line in content.split('\n'):
-        if line.startswith('```'):
-            if in_code_block:
-                # End code block
-                if current_code_block["content"]:
-                    current_section["code_blocks"].append(current_code_block)
-                current_code_block = {"language": "", "content": []}
-                in_code_block = False
+    # Process all relevant elements
+    for element in soup.find_all([
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'p', 'div', 'pre', 'table', 'ul', 'ol',
+        'blockquote', 'a'
+    ]):
+        result = process_element(element)
+        if result:
+            if result.get('l'):  # It's a heading
+                if current_section and current_section.get('c'):
+                    sections.append(current_section)
+                current_section = result
+            elif current_section:
+                current_section['c'].append(result)
             else:
-                # Start code block
-                in_code_block = True
-                current_code_block["language"] = line[3:].strip()
-        elif in_code_block:
-            current_code_block["content"].append(line)
-        elif line.startswith('# '):
-            if current_section["content"] or current_section["code_blocks"]:
-                sections.append(current_section)
-            current_section = {"title": line[2:], "content": [], "subsections": [], "code_blocks": []}
-        elif line.startswith('## '):
-            if current_section["content"]:
-                current_section["subsections"].append({
-                    "title": line[3:],
-                    "content": [],
-                    "code_blocks": []
-                })
-        else:
-            if current_section["subsections"]:
-                current_section["subsections"][-1]["content"].append(line)
-            else:
-                current_section["content"].append(line)
+                # Handle content before first heading
+                current_section = {
+                    "t": "Introduction",
+                    "l": 1,
+                    "c": [result]
+                }
     
-    if current_section["content"] or current_section["code_blocks"]:
+    if current_section and current_section.get('c'):
         sections.append(current_section)
+    
+    # If no sections were created but we have content, create a default section
+    if not sections and soup.find(['p', 'div', 'pre', 'table', 'ul', 'ol']):
+        sections.append({
+            "t": "Content",
+            "l": 1,
+            "c": [
+                result for element in soup.find_all(['p', 'div', 'pre', 'table', 'ul', 'ol'])
+                if (result := process_element(element))
+            ]
+        })
     
     return sections
 
 async def save_page_content(page_content: PageContent):
-    """Save page content to both .md and .json files"""
+    """Save page content to both .md and .json files with enhanced structure"""
     try:
         logger.info(f"Creating storage directory at: {STORAGE_DIR}")
         STORAGE_DIR.mkdir(exist_ok=True)
@@ -288,39 +411,148 @@ async def save_page_content(page_content: PageContent):
         json_path = STORAGE_DIR / f"{base_name}.json"
         logger.info(f"Generated paths - MD: {md_path}, JSON: {json_path}")
         
-        # Save markdown with minimal headers and preserved code blocks
-        markdown_content = f"""# {page_content.title}
-{page_content.url}
-
-{page_content.content.strip()}
-"""
+        # Process the content through BeautifulSoup
+        sections = await process_content(page_content.content)
+        
+        def format_list_items_md(items, list_type="unordered", indent=""):
+            """Format list items for markdown with proper indentation"""
+            result = []
+            for i, item in enumerate(items, 1):
+                bullet = "- " if list_type == "unordered" else f"{i}. "
+                result.append(f"{indent}{bullet}{item['text']}")
+                if item.get('sub_items'):
+                    sub_indent = indent + "  "
+                    result.extend(format_list_items_md(item['sub_items'], list_type, sub_indent))
+            return result
+        
+        def format_table_md(table):
+            """Format table for markdown"""
+            if not table.get('rows'):
+                return ""
+            
+            headers = table.get('headers', [])
+            if not headers and table['rows']:
+                # Create numeric headers if none exist
+                headers = [f"Column {i+1}" for i in range(len(table['rows'][0]))]
+            
+            # Create header row
+            result = [
+                "| " + " | ".join(headers) + " |",
+                "| " + " | ".join(["---"] * len(headers)) + " |"
+            ]
+            
+            # Add data rows
+            for row in table['rows']:
+                result.append("| " + " | ".join(str(cell) for cell in row) + " |")
+            
+            return "\n".join(result)
+        
+        def format_content_md(content_items):
+            """Format content items for markdown with enhanced styling"""
+            md_lines = []
+            for item in content_items:
+                if not item:
+                    continue
+                    
+                item_type = item.get('type', 'text')
+                
+                if item_type == 'text':
+                    md_lines.append(f"\n{item['text']}\n")
+                
+                elif item_type in ['note', 'warning', 'tip', 'info']:
+                    symbol = {
+                        'note': 'ℹ️',
+                        'warning': '⚠️',
+                        'tip': '💡',
+                        'info': 'ℹ️'
+                    }.get(item_type, 'ℹ️')
+                    md_lines.append(f"\n> {symbol} **{item_type.upper()}**: {item['text']}\n")
+                
+                elif item_type == 'code':
+                    lang = item.get('lang', '')
+                    md_lines.append(f"\n```{lang}\n{item['code']}\n```\n")
+                
+                elif item_type == 'inline_code':
+                    md_lines.append(f"`{item['code']}`")
+                
+                elif item_type == 'list':
+                    md_lines.extend(format_list_items_md(item['items'], item.get('list_type', 'unordered')))
+                    md_lines.append("")  # Add spacing after list
+                
+                elif item_type == 'table':
+                    md_lines.append("\n" + format_table_md(item) + "\n")
+                
+                elif item_type == 'link':
+                    md_lines.append(f"[{item['text']}]({item['url']})")
+            
+            return "\n".join(md_lines)
+        
+        # Generate markdown content with enhanced formatting
+        markdown_lines = [
+            f"# {page_content.title}",
+            f"\nSource: {page_content.url}",
+            f"\nLast Updated: {page_content.last_crawled.strftime('%Y-%m-%d %H:%M:%S')}\n",
+            "## Table of Contents\n"
+        ]
+        
+        # Generate table of contents
+        for section in sections:
+            if section.get('t'):
+                level = section.get('l', 1)
+                indent = "  " * (level - 1)
+                # Create GitHub-compatible anchor links
+                anchor = section['t'].lower().replace(' ', '-').replace('/', '').replace('(', '').replace(')', '')
+                markdown_lines.append(f"{indent}- [{section['t']}](#{anchor})")
+        
+        markdown_lines.append("\n---\n")  # Add separator after TOC
+        
+        # Add section content
+        for section in sections:
+            if section.get('t'):
+                level = section.get('l', 1)
+                markdown_lines.append(f"\n{'#' * level} {section['t']}\n")
+                if section.get('c'):
+                    markdown_lines.append(format_content_md(section['c']))
+        
+        markdown_content = "\n".join(markdown_lines)
         logger.info(f"Writing markdown file ({len(markdown_content)} bytes) to: {md_path}")
         await asyncio.to_thread(lambda: md_path.write_text(markdown_content, encoding='utf-8'))
         logger.info(f"Markdown file written successfully: {md_path.exists()}, Size: {md_path.stat().st_size} bytes")
         
-        # Save JSON with AI-optimized structure
-        # Create minified but AI-friendly JSON structure
+        # Create enhanced AI-friendly JSON structure
         json_content = {
-            "u": page_content.url,  # url
-            "t": page_content.title,  # title
-            "s": [  # sections
+            "d": {  # document
+                "t": page_content.title,  # title
+                "u": page_content.url,  # url
+                "m": page_content.metadata,  # metadata
+                "ts": page_content.last_crawled.isoformat(),  # timestamp
+                "s": [  # sections
+                    {
+                        "t": s.get("t"),  # title
+                        "l": s.get("l", 1),  # level
+                        "c": [  # content
+                            {
+                                "k": item.get("type", "text"),  # kind
+                                **({"t": item["text"]} if "text" in item else {}),  # text
+                                **({"l": item["lang"], "c": item["code"]} if item.get("type") == "code" else {}),  # code
+                                **({"i": item["items"]} if item.get("type") == "list" else {}),  # list items
+                                **({"h": item["headers"], "r": item["rows"]} if item.get("type") == "table" else {}),  # table
+                                **({"u": item["url"]} if item.get("type") == "link" else {})  # link
+                            }
+                            for item in s.get("c", [])
+                            if item
+                        ]
+                    }
+                    for s in sections
+                    if s and s.get("t")
+                ]
+            },
+            "r": [  # references
                 {
-                    "h": s.get("title"),  # heading
-                    "c": "\n".join(s.get("content", [])),  # content
-                    "code": [  # code blocks
-                        {
-                            "l": b.get("language", ""),  # language
-                            "c": "\n".join(b.get("content", []))  # code
-                        }
-                        for b in s.get("code_blocks", [])
-                        if b.get("content")
-                    ]
+                    "u": link,  # url
+                    "t": datetime.now().isoformat()  # timestamp when reference was found
                 }
-                for s in page_content.sections
-                if s.get("title") or s.get("content") or s.get("code_blocks")
-            ],
-            "l": [  # links
-                link for link in page_content.internal_links
+                for link in page_content.internal_links
                 if link and not link.startswith("#")  # Skip anchor links
             ]
         }
@@ -385,13 +617,8 @@ async def crawl_pages(pages: List[DiscoveredPage]) -> CrawlResult:
                     logger.info(f"Crawling page: {page.url}")
                     result = await crawler.arun(url=page.url, config=crawler_config)
                     
-                    if result and hasattr(result, 'markdown_v2') and result.markdown_v2:
-                        content = None
-                        if hasattr(result.markdown_v2, 'fit_markdown') and result.markdown_v2.fit_markdown:
-                            content = result.markdown_v2.fit_markdown
-                        elif hasattr(result.markdown_v2, 'raw_markdown') and result.markdown_v2.raw_markdown:
-                            content = result.markdown_v2.raw_markdown
-                        
+                    if result and hasattr(result, 'page_content') and result.page_content:
+                        content = result.page_content
                         if content:
                             # Process content
                             sections = await process_content(content)
