@@ -1,0 +1,59 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      target: production
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_BACKEND_URL=http://backend:24125
+    volumes:
+      - ./storage:/app/storage:ro  # Bind mount to local storage directory
+    networks:
+      - devdocs-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      target: production
+    ports:
+      - "24125:24125"
+    environment:
+      - PYTHONPATH=/app
+      - CHROME_BIN=/usr/bin/chromium
+      - CHROMEDRIVER_PATH=/usr/bin/chromedriver
+      - CRAWLER_CACHE_ENABLED=true
+      - CRAWLER_TIMEOUT=120000
+      - CRAWLER_WORD_THRESHOLD=5
+      - MCP_SERVER_HOST=host.docker.internal
+      - MCP_SERVER_PORT=50051
+    volumes:
+      - ./storage:/app/storage  # Bind mount to local storage directory
+      - ./logs:/app/logs       # Bind mount for logs
+    networks:
+      - devdocs-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:24125/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "24125", "--workers", "4"]
+    restart: unless-stopped
+
+networks:
+  devdocs-network:
+    driver: bridge
