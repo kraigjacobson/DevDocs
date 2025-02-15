@@ -3,11 +3,10 @@
 import { useState, useEffect } from 'react'
 import UrlInput from '@/components/UrlInput'
 import ProcessingBlock from '@/components/ProcessingBlock'
-import SubdomainList from '@/components/SubdomainList'
 import MarkdownOutput from '@/components/MarkdownOutput'
 import StoredFiles from '@/components/StoredFiles'
 import MCPServerStatus from '@/components/MCPServerStatus'
-import { discoverSubdomains, crawlPages, validateUrl, formatBytes } from '@/lib/crawl-service'
+import { discoverSubdomains, validateUrl, formatBytes } from '@/lib/crawl-service'
 import { saveMarkdown, loadMarkdown } from '@/lib/storage'
 import { useToast } from "@/components/ui/use-toast"
 import { DiscoveredPage } from '@/lib/types'
@@ -15,8 +14,6 @@ import { DiscoveredPage } from '@/lib/types'
 export default function Home() {
   const [url, setUrl] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
-  const [discoveredPages, setDiscoveredPages] = useState<DiscoveredPage[]>([])
-  const [isCrawling, setIsCrawling] = useState(false)
   const [markdown, setMarkdown] = useState('')
   const [stats, setStats] = useState({
     subdomainsParsed: 0,
@@ -39,124 +36,35 @@ export default function Home() {
     setUrl(submittedUrl)
     setIsProcessing(true)
     setMarkdown('')
-    setDiscoveredPages([])
     
     try {
-      console.log('Discovering pages for:', submittedUrl, 'with depth:', depth)
-      const pages = await discoverSubdomains({ url: submittedUrl, depth })
-      console.log('Discovered pages:', pages)
+      console.log('Starting discovery and crawl for:', submittedUrl, 'with depth:', depth)
+      const result = await discoverSubdomains({ url: submittedUrl, depth })
+      console.log('Discovery and crawl result:', result)
       
-      setDiscoveredPages(pages)
-      setStats(prev => ({
-        ...prev,
-        subdomainsParsed: pages.length
-      }))
+      if (result.crawl_result) {
+        setMarkdown(result.crawl_result.markdown)
+        setStats({
+          subdomainsParsed: result.pages.length,
+          pagesCrawled: result.pages.length,
+          dataExtracted: formatBytes(result.crawl_result.markdown.length),
+          errorsEncountered: 0
+        })
+      }
       
       toast({
-        title: "Pages Discovered",
-        description: `Found ${pages.length} related pages at depth ${depth}`
+        title: "Processing Complete",
+        description: `Found and processed ${result.pages?.length || 0} pages at depth ${depth}`
       })
     } catch (error) {
-      console.error('Error discovering pages:', error)
+      console.error('Error processing URL:', error)
       toast({
         title: "Error",
-        description: error instanceof Error ? error.message : "Failed to discover pages",
+        description: error instanceof Error ? error.message : "Failed to process URL",
         variant: "destructive"
       })
     } finally {
       setIsProcessing(false)
-    }
-  }
-
-  const handleCrawlSelected = async (selectedUrls: string[]) => {
-    setIsCrawling(true)
-    try {
-      const selectedPages = discoveredPages.filter(page => selectedUrls.includes(page.url))
-      console.log('Starting crawl for selected pages:', selectedPages)
-      
-      // Update status to pending for selected pages
-      setDiscoveredPages(pages =>
-        pages.map(page => ({
-          ...page,
-          status: selectedUrls.includes(page.url) ? 'pending' as const : page.status,
-          internalLinks: page.internalLinks?.map(link => ({
-            ...link,
-            status: selectedUrls.includes(link.href) ? 'pending' as const : link.status || 'pending'
-          }))
-        }))
-      )
-      
-      const result = await crawlPages(selectedPages)
-      console.log('Crawl result:', result)
-      
-      if (result.error) {
-        throw new Error(result.error)
-      }
-      
-      try {
-        await saveMarkdown(url, result.markdown)
-        console.log('Saved content for:', url)
-        
-        setMarkdown(result.markdown)
-        setStats(prev => ({
-          ...prev,
-          pagesCrawled: selectedPages.length,
-          dataExtracted: formatBytes(result.markdown.length)
-        }))
-
-        // Update status to crawled for successfully crawled pages
-        setDiscoveredPages(pages =>
-          pages.map(page => ({
-            ...page,
-            status: selectedUrls.includes(page.url) ? 'crawled' as const : page.status,
-            internalLinks: page.internalLinks?.map(link => ({
-              ...link,
-              status: selectedUrls.includes(link.href) ? 'crawled' as const : link.status || 'pending'
-            }))
-          }))
-        )
-
-        toast({
-          title: "Content Saved",
-          description: `Crawled content has been saved and can be loaded again later`
-        })
-      } catch (error) {
-        console.error('Error saving content:', error)
-        toast({
-          title: "Error",
-          description: "Failed to save content for later use",
-          variant: "destructive"
-        })
-      }
-      
-      toast({
-        title: "Crawling Complete",
-        description: "All pages have been crawled and processed"
-      })
-    } catch (error) {
-      console.error('Error crawling pages:', error)
-      setStats(prev => ({
-        ...prev,
-        errorsEncountered: prev.errorsEncountered + 1
-      }))
-      // Update status to error for failed pages
-      setDiscoveredPages(pages =>
-        pages.map(page => ({
-          ...page,
-          status: selectedUrls.includes(page.url) ? 'error' as const : page.status,
-          internalLinks: page.internalLinks?.map(link => ({
-            ...link,
-            status: selectedUrls.includes(link.href) ? 'error' as const : link.status || 'pending'
-          }))
-        }))
-      )
-      toast({
-        title: "Error",
-        description: error instanceof Error ? error.message : "Failed to crawl pages",
-        variant: "destructive"
-      })
-    } finally {
-      setIsCrawling(false)
     }
   }
 
@@ -178,7 +86,7 @@ export default function Home() {
           <h2 className="text-2xl font-semibold mb-4 text-purple-400">Processing Status</h2>
           <div className="flex gap-4">
             <ProcessingBlock
-              isProcessing={isProcessing || isCrawling}
+              isProcessing={isProcessing}
               stats={stats}
             />
           </div>
@@ -187,14 +95,6 @@ export default function Home() {
         <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700 shadow-xl">
           <h2 className="text-2xl font-semibold mb-4 text-blue-400">Start Exploration</h2>
           <UrlInput onSubmit={handleSubmit} />
-        </div>
-
-        <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700 shadow-xl">
-          <SubdomainList
-            subdomains={discoveredPages}
-            onCrawlSelected={handleCrawlSelected}
-            isProcessing={isCrawling}
-          />
         </div>
 
         <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700 shadow-xl">

@@ -54,17 +54,23 @@ def get_browser_config() -> BrowserConfig:
     )
 
 def get_crawler_config(session_id: str = None) -> CrawlerRunConfig:
-    """Get crawler configuration for content extraction"""
+    """Get crawler configuration optimized for developer documentation"""
     markdown_generator = DefaultMarkdownGenerator(
         content_filter=PruningContentFilter(
-            threshold=0.2,
+            threshold=0.4,  # Increased threshold to focus on main content
             threshold_type="dynamic",
-            min_word_threshold=5
+            min_word_threshold=3  # Reduced to catch short code examples
         ),
         options={
-            "body_width": 80,
+            "body_width": 120,  # Wider for code blocks
             "ignore_images": True,
-            "escape_html": True
+            "escape_html": False,
+            "code_block_style": "fenced",
+            "preserve_newlines": True,
+            "emphasis_marks": ['_'],  # Simplified emphasis
+            "strip_comments": False,  # Keep code comments
+            "headers_as_sections": True,  # Better structure
+            "strip_multiple_newlines": True  # Clean output
         }
     )
     
@@ -207,94 +213,220 @@ async def discover_pages(
         logger.error(f"Error discovering pages: {str(e)}")
         return [DiscoveredPage(url=url, title="Main Page", status="error")]
 
+import json
+import os
+import asyncio
+from datetime import datetime
+from pathlib import Path
+
+# Use absolute path that matches Docker volume mount
+STORAGE_DIR = Path("/app/storage/markdown")
+
+class PageContent(BaseModel):
+    """Structured content for AI consumption"""
+    url: str
+    title: str
+    content: str
+    metadata: dict
+    last_crawled: datetime
+    internal_links: List[str]
+    sections: List[dict]  # Hierarchical content structure
+
+async def process_content(content: str) -> dict:
+    """Process markdown content into structured sections with code blocks"""
+    sections = []
+    current_section = {"title": None, "content": [], "subsections": [], "code_blocks": []}
+    in_code_block = False
+    current_code_block = {"language": "", "content": []}
+    
+    for line in content.split('\n'):
+        if line.startswith('```'):
+            if in_code_block:
+                # End code block
+                if current_code_block["content"]:
+                    current_section["code_blocks"].append(current_code_block)
+                current_code_block = {"language": "", "content": []}
+                in_code_block = False
+            else:
+                # Start code block
+                in_code_block = True
+                current_code_block["language"] = line[3:].strip()
+        elif in_code_block:
+            current_code_block["content"].append(line)
+        elif line.startswith('# '):
+            if current_section["content"] or current_section["code_blocks"]:
+                sections.append(current_section)
+            current_section = {"title": line[2:], "content": [], "subsections": [], "code_blocks": []}
+        elif line.startswith('## '):
+            if current_section["content"]:
+                current_section["subsections"].append({
+                    "title": line[3:],
+                    "content": [],
+                    "code_blocks": []
+                })
+        else:
+            if current_section["subsections"]:
+                current_section["subsections"][-1]["content"].append(line)
+            else:
+                current_section["content"].append(line)
+    
+    if current_section["content"] or current_section["code_blocks"]:
+        sections.append(current_section)
+    
+    return sections
+
+async def save_page_content(page_content: PageContent):
+    """Save page content to both .md and .json files"""
+    try:
+        logger.info(f"Creating storage directory at: {STORAGE_DIR}")
+        STORAGE_DIR.mkdir(exist_ok=True)
+        logger.info(f"Storage directory exists: {STORAGE_DIR.exists()}, Is writable: {os.access(STORAGE_DIR, os.W_OK)}")
+        
+        # Generate filenames
+        base_name = page_content.url.replace('https://', '').replace('http://', '').replace('/', '_').lower()
+        md_path = STORAGE_DIR / f"{base_name}.md"
+        json_path = STORAGE_DIR / f"{base_name}.json"
+        logger.info(f"Generated paths - MD: {md_path}, JSON: {json_path}")
+        
+        # Save markdown with minimal headers and preserved code blocks
+        markdown_content = f"""# {page_content.title}
+{page_content.url}
+
+{page_content.content.strip()}
+"""
+        logger.info(f"Writing markdown file ({len(markdown_content)} bytes) to: {md_path}")
+        await asyncio.to_thread(lambda: md_path.write_text(markdown_content, encoding='utf-8'))
+        logger.info(f"Markdown file written successfully: {md_path.exists()}, Size: {md_path.stat().st_size} bytes")
+        
+        # Save JSON with AI-optimized structure
+        # Create minified but AI-friendly JSON structure
+        json_content = {
+            "u": page_content.url,  # url
+            "t": page_content.title,  # title
+            "s": [  # sections
+                {
+                    "h": s.get("title"),  # heading
+                    "c": "\n".join(s.get("content", [])),  # content
+                    "code": [  # code blocks
+                        {
+                            "l": b.get("language", ""),  # language
+                            "c": "\n".join(b.get("content", []))  # code
+                        }
+                        for b in s.get("code_blocks", [])
+                        if b.get("content")
+                    ]
+                }
+                for s in page_content.sections
+                if s.get("title") or s.get("content") or s.get("code_blocks")
+            ],
+            "l": [  # links
+                link for link in page_content.internal_links
+                if link and not link.startswith("#")  # Skip anchor links
+            ]
+        }
+        json_str = json.dumps(json_content, separators=(',', ':'))  # Minified
+        logger.info(f"Writing JSON file ({len(json_str)} bytes) to: {json_path}")
+        await asyncio.to_thread(lambda: json_path.write_text(json_str, encoding='utf-8'))
+        logger.info(f"JSON file written successfully: {json_path.exists()}, Size: {json_path.stat().st_size} bytes")
+        
+        # List directory contents after saving
+        logger.info("Storage directory contents:")
+        for file in STORAGE_DIR.iterdir():
+            logger.info(f"- {file.name}: {file.stat().st_size} bytes")
+            
+    except Exception as e:
+        logger.error(f"Error saving page content: {str(e)}", exc_info=True)
+        raise
+
 async def crawl_pages(pages: List[DiscoveredPage]) -> CrawlResult:
     """
-    Crawl multiple pages and combine their content into a single markdown document.
+    Crawl pages and save content incrementally, skipping already crawled pages
     """
-    all_markdown = []
     total_size = 0
     errors = 0
-    crawled_urls = set()
+    stats = CrawlStats()
     
     try:
+        logger.info(f"Starting crawl for {len(pages)} pages")
+        logger.info(f"Storage directory: {STORAGE_DIR}")
+        logger.info(f"Storage directory exists: {STORAGE_DIR.exists()}")
+        if STORAGE_DIR.exists():
+            logger.info(f"Current storage contents: {[f.name for f in STORAGE_DIR.iterdir()]}")
+        
         browser_config = get_browser_config()
         crawler_config = get_crawler_config()
         logger.info("Initializing crawler with browser config: %s", browser_config)
-        logger.info("Using crawler config: %s", crawler_config)
         
         async with AsyncWebCrawler(config=browser_config) as crawler:
             for page in pages:
-                if page.url in crawled_urls:
-                    continue
-                    
+                # Check if recently crawled
+                base_name = page.url.replace('https://', '').replace('http://', '').replace('/', '_').lower()
+                json_path = STORAGE_DIR / f"{base_name}.json"
+                logger.info(f"Checking existing file for {page.url} at {json_path}")
+                logger.info(f"File exists: {json_path.exists()}")
+                
+                if json_path.exists():
+                    try:
+                        data = json.loads(json_path.read_text(encoding='utf-8'))
+                        last_crawled = datetime.fromisoformat(data['last_crawled'])
+                        time_since_crawl = datetime.now() - last_crawled
+                        logger.info(f"Last crawled: {last_crawled}, Time since crawl: {time_since_crawl}")
+                        
+                        # Skip if crawled in last 24 hours
+                        if time_since_crawl.days < 1:
+                            logger.info(f"Skipping recently crawled page: {page.url} (crawled {time_since_crawl.total_seconds()/3600:.1f} hours ago)")
+                            continue
+                        else:
+                            logger.info(f"Recrawling page: {page.url} (last crawled {time_since_crawl.days} days ago)")
+                    except Exception as e:
+                        logger.warning(f"Error reading existing JSON for {page.url}, will recrawl: {e}", exc_info=True)
+                
                 try:
                     logger.info(f"Crawling page: {page.url}")
                     result = await crawler.arun(url=page.url, config=crawler_config)
                     
                     if result and hasattr(result, 'markdown_v2') and result.markdown_v2:
-                        page_markdown = f"# {page.title or 'Untitled Page'}\n"
-                        page_markdown += f"URL: {page.url}\n\n"
-                        
                         content = None
                         if hasattr(result.markdown_v2, 'fit_markdown') and result.markdown_v2.fit_markdown:
                             content = result.markdown_v2.fit_markdown
-                            logger.info(f"Using fit_markdown for {page.url}")
                         elif hasattr(result.markdown_v2, 'raw_markdown') and result.markdown_v2.raw_markdown:
                             content = result.markdown_v2.raw_markdown
-                            logger.info(f"Falling back to raw_markdown for {page.url}")
                         
                         if content:
-                            filtered_lines = []
-                            skip_next = False
-                            for line in content.split('\n'):
-                                if skip_next:
-                                    skip_next = False
-                                    continue
-                                    
-                                if 'To navigate the symbols, press' in line:
-                                    skip_next = True
-                                    continue
-                                    
-                                if any(x in line for x in [
-                                    'Skip Navigation',
-                                    'Search...',
-                                    '⌘K',
-                                    'symbols inside <root>'
-                                ]):
-                                    continue
-                                    
-                                filtered_lines.append(line)
+                            # Process content
+                            sections = await process_content(content)
                             
-                            filtered_content = '\n'.join(filtered_lines).strip()
-                            if filtered_content:
-                                page_markdown += filtered_content
-                                page_markdown += "\n\n---\n\n"
-                                all_markdown.append(page_markdown)
-                                total_size += len(page_markdown.encode('utf-8'))
-                                logger.info(f"Successfully extracted content from {page.url}")
-                                
-                                # Mark URL as crawled
-                                crawled_urls.add(page.url)
-                                page.status = "crawled"
-                            else:
-                                logger.warning(f"Skipping {page.url} - filtered content was empty")
-                                errors += 1
-                                page.status = "error"
+                            # Create structured content
+                            page_content = PageContent(
+                                url=page.url,
+                                title=page.title or "Untitled Page",
+                                content=content,
+                                metadata={
+                                    "crawl_timestamp": datetime.now().isoformat(),
+                                    "content_type": "documentation",
+                                },
+                                last_crawled=datetime.now(),
+                                internal_links=[link.href for link in (page.internalLinks or [])],
+                                sections=sections
+                            )
+                            
+                            # Save content
+                            await save_page_content(page_content)
+                            
+                            total_size += len(content.encode('utf-8'))
+                            stats.pages_crawled += 1
+                            page.status = "crawled"
+                            
+                            logger.info(f"Successfully processed and saved content from {page.url}")
                         else:
-                            logger.warning(f"Skipping {page.url} - no markdown content available")
+                            logger.warning(f"No content extracted from {page.url}")
                             errors += 1
                             page.status = "error"
-                    else:
-                        logger.warning(f"Skipping {page.url} - no valid result")
-                        errors += 1
-                        page.status = "error"
-                        
+                    
                 except Exception as e:
                     logger.error(f"Error crawling page {page.url}: {str(e)}")
                     errors += 1
                     page.status = "error"
-
-            combined_markdown = "".join(all_markdown)
             
             size_str = f"{total_size} B"
             if total_size > 1024:
@@ -302,16 +434,15 @@ async def crawl_pages(pages: List[DiscoveredPage]) -> CrawlResult:
             if total_size > 1024*1024:
                 size_str = f"{total_size/(1024*1024):.2f} MB"
             
-            stats = CrawlStats(
-                subdomains_parsed=len(pages),
-                pages_crawled=len(crawled_urls),
-                data_extracted=size_str,
-                errors_encountered=errors
-            )
+            stats.subdomains_parsed = len(pages)
+            stats.data_extracted = size_str
+            stats.errors_encountered = errors
             
             logger.info(f"Completed crawling with stats: {stats}")
+            
+            # Return empty markdown since we're saving files directly
             return CrawlResult(
-                markdown=combined_markdown,
+                markdown="",
                 stats=stats
             )
             

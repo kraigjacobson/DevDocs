@@ -20,17 +20,14 @@ export interface CrawlStats {
 
 export interface CrawlResult {
   markdown: string
-  links: {
-    internal: Array<{
-      href: string
-      text: string
-    }>
-    external: Array<{
-      href: string
-      text: string
-    }>
-  }
-  error?: string
+  stats: CrawlStats
+}
+
+export interface DiscoverResponse {
+  message: string
+  success: boolean
+  pages: DiscoveredPage[]
+  crawl_result: CrawlResult | null
 }
 
 export interface DiscoverOptions {

@@ -41,6 +41,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY backend/ .
+COPY fast-markdown-mcp/src/fast_markdown_mcp /app/fast_markdown_mcp
 
 # Install Playwright system dependencies first as root
 RUN playwright install-deps
@@ -51,10 +52,18 @@ RUN useradd -m -U -s /bin/bash appuser && \
     mkdir -p /home/appuser/.cache && \
     chown -R appuser:appuser /home/appuser/.cache
 
+# Create script to run both servers
+RUN echo '#!/bin/bash\n\
+uvicorn app.main:app --host 0.0.0.0 --port 24125 --workers 4 & \n\
+python -m fast_markdown_mcp.server /app/storage/markdown' > /app/run.sh && \
+    chmod +x /app/run.sh
+
 # Switch to appuser and install browser
 USER appuser
 RUN playwright install chromium
 
 # Set runtime configuration
 ENV PYTHONUNBUFFERED=1
-EXPOSE 24125
+EXPOSE 24125 50051
+
+CMD ["/app/run.sh"]

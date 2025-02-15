@@ -6,24 +6,63 @@ const STORAGE_DIR = path.join(process.cwd(), 'storage/markdown')
 
 export async function POST(request: Request) {
   try {
-    const { url, content } = await request.json()
+    const { url, content, metadata } = await request.json()
     
     // Create storage directory if it doesn't exist
     await fs.mkdir(STORAGE_DIR, { recursive: true })
     
-    // Generate filename from URL
-    const filename = url
+    // Generate base filename from URL
+    const baseFilename = url
       .replace(/^https?:\/\//, '')
       .replace(/[^a-z0-9]/gi, '_')
-      .toLowerCase() + '.md'
+      .toLowerCase()
     
-    const filePath = path.join(STORAGE_DIR, filename)
-    await fs.writeFile(filePath, content, 'utf-8')
+    const mdPath = path.join(STORAGE_DIR, `${baseFilename}.md`)
+    const jsonPath = path.join(STORAGE_DIR, `${baseFilename}.json`)
     
-    return NextResponse.json({ success: true })
+    // Update or create markdown file
+    await fs.writeFile(mdPath, content, 'utf-8')
+    
+    // Update or create JSON file
+    let jsonContent = {
+      url,
+      content,
+      metadata: {
+        ...metadata,
+        lastUpdated: new Date().toISOString(),
+        wordCount: content.split(/\s+/).length,
+        charCount: content.length
+      }
+    }
+    
+    // If JSON file exists, preserve existing metadata
+    try {
+      const existingJson = await fs.readFile(jsonPath, 'utf-8')
+      const existingData = JSON.parse(existingJson)
+      jsonContent = {
+        ...existingData,
+        ...jsonContent,
+        metadata: {
+          ...existingData.metadata,
+          ...jsonContent.metadata
+        }
+      }
+    } catch (e) {
+      // No existing JSON file, use new content
+    }
+    
+    await fs.writeFile(jsonPath, JSON.stringify(jsonContent, null, 2), 'utf-8')
+    
+    return NextResponse.json({
+      success: true,
+      files: {
+        markdown: mdPath,
+        json: jsonPath
+      }
+    })
   } catch (error) {
     return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : 'Failed to save markdown' },
+      { success: false, error: error instanceof Error ? error.message : 'Failed to save content' },
       { status: 500 }
     )
   }

@@ -14,7 +14,7 @@ CMD ["npm", "run", "dev"]
 # Builder stage
 FROM base AS builder
 COPY package*.json ./
-RUN npm install --production
+RUN npm install
 COPY . .
 RUN npm run build
 
@@ -24,10 +24,11 @@ COPY --from=builder /app/next.config.mjs ./
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./
+COPY --from=builder /app/app ./app
 
 # Set runtime configuration
-ENV PORT=3001
+ENV PORT=3000
 ENV NODE_OPTIONS="--max-old-space-size=4096"
-EXPOSE 3001
+EXPOSE 3000
 
 CMD ["npm", "start"]

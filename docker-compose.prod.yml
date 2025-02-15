@@ -5,12 +5,13 @@ services:
       dockerfile: Dockerfile.frontend
       target: production
     ports:
-      - "3001:3001"
+      - "3001:3000"
     environment:
       - NODE_ENV=production
       - NEXT_PUBLIC_BACKEND_URL=http://backend:24125
+      - NEXT_PUBLIC_ENABLE_MCP_SERVER=false
     volumes:
-      - ./storage:/app/storage:ro  # Bind mount to local storage directory
+      - ./storage:/app/storage:ro  # Read-only access for frontend
     networks:
       - devdocs-network
     depends_on:
@@ -30,6 +31,7 @@ services:
       target: production
     ports:
       - "24125:24125"
+      - "50051:50051"
     environment:
       - PYTHONPATH=/app
       - CHROME_BIN=/usr/bin/chromium
@@ -37,11 +39,11 @@ services:
       - CRAWLER_CACHE_ENABLED=true
       - CRAWLER_TIMEOUT=120000
       - CRAWLER_WORD_THRESHOLD=5
-      - MCP_SERVER_HOST=host.docker.internal
+      - MCP_SERVER_HOST=0.0.0.0
       - MCP_SERVER_PORT=50051
     volumes:
-      - ./storage:/app/storage  # Bind mount to local storage directory
-      - ./logs:/app/logs       # Bind mount for logs
+      - ./storage:/app/storage:rw  # Read-write access for backend
+      - ./logs:/app/logs:rw       # Read-write access for logs
     networks:
       - devdocs-network
     extra_hosts:

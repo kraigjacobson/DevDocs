@@ -30,6 +30,13 @@ const MCPServerStatus = () => {
   const [config, setConfig] = useState<MCPConfig | null>(null);
 
   useEffect(() => {
+    // Check if MCP server is enabled
+    const mcpEnabled = process.env.NEXT_PUBLIC_ENABLE_MCP_SERVER === 'true';
+    if (!mcpEnabled) {
+      setStatus({ status: 'stopped', details: 'MCP server is disabled by configuration' });
+      return;
+    }
+
     // Use environment variables or fallback to default paths
     const rootDir = process.env.NEXT_PUBLIC_ROOT_DIR || '/Users/cyberagi/Documents/GitHub/DevDocs';
     

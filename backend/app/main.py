@@ -166,24 +166,35 @@ async def get_mcp_logs():
 
 @app.post("/api/discover")
 async def discover_endpoint(request: DiscoverRequest):
-    """Discover pages related to the provided URL"""
+    """Discover and crawl pages related to the provided URL"""
     try:
         logger.info(f"Received discover request for URL: {request.url} with depth: {request.depth}")
         pages = await discover_pages(request.url, max_depth=request.depth)
         
-        # Log the results
+        # Log the discovery results
         if pages:
             logger.info(f"Successfully discovered {len(pages)} pages")
             for page in pages:
                 logger.debug(f"Discovered page: {page.url} ({page.status})")
         else:
             logger.warning("No pages discovered")
+            return {
+                "message": "No pages discovered",
+                "success": True,
+                "pages": [],
+                "crawl_result": None
+            }
             
-        # Always return a valid response, even if no pages were found
+        # Automatically crawl the discovered pages
+        logger.info(f"Starting crawl for {len(pages)} discovered pages")
+        crawl_result = await crawl_pages(pages)
+        logger.info(f"Crawl completed with stats: {crawl_result.stats}")
+        
         return {
-            "pages": pages or [],  # Ensure we always return an array
-            "message": f"Found {len(pages)} pages" if pages else "No pages discovered",
-            "success": True
+            "message": f"Found and crawled {len(pages)} pages",
+            "success": True,
+            "pages": pages,
+            "crawl_result": crawl_result
         }
     except Exception as e:
         logger.error(f"Error discovering pages: {str(e)}", exc_info=True)
@@ -197,29 +208,53 @@ async def discover_endpoint(request: DiscoverRequest):
 
 @app.post("/api/crawl")
 async def crawl_endpoint(request: CrawlRequest):
-    """Crawl the provided pages and generate markdown content"""
+    """Crawl the provided pages and save content incrementally"""
     try:
         logger.info(f"Received crawl request for {len(request.pages)} pages")
         result = await crawl_pages(request.pages)
         
         # Log the results
         logger.info(f"Successfully crawled pages. Stats: {result.stats}")
+        
+        # Return stats and list of processed files
+        storage_dir = Path("storage/markdown")
+        processed_files = []
+        
+        for page in request.pages:
+            base_name = page.url.replace('https://', '').replace('http://', '').replace('/', '_').lower()
+            md_path = storage_dir / f"{base_name}.md"
+            json_path = storage_dir / f"{base_name}.json"
+            
+            if md_path.exists() and json_path.exists():
+                try:
+                    json_data = json.loads(json_path.read_text(encoding='utf-8'))
+                    processed_files.append({
+                        "url": page.url,
+                        "status": page.status,
+                        "files": {
+                            "markdown": str(md_path),
+                            "json": str(json_path)
+                        },
+                        "metadata": json_data.get("metadata", {})
+                    })
+                except Exception as e:
+                    logger.error(f"Error reading processed file data: {e}")
+        
         return {
-            "markdown": result.markdown,
             "stats": result.stats.dict(),
+            "processed_files": processed_files,
             "success": True
         }
     except Exception as e:
         logger.error(f"Error crawling pages: {str(e)}", exc_info=True)
-        # Return a structured error response
         return {
-            "markdown": "",
             "stats": {
                 "subdomains_parsed": 0,
                 "pages_crawled": 0,
                 "data_extracted": "0 KB",
                 "errors_encountered": 1
             },
+            "processed_files": [],
             "success": False,
             "error": str(e)
         }
